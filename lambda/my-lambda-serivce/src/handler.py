@@ -1,8 +1,13 @@
 import json
 import logging
 from typing import Any, Dict, Tuple
+from datetime import datetime, timezone
 
 from .exceptions import DomainError, PersistenceError, ValidationError
+from .models import UserCreate, User
+from .db import put_user_item
+# pyrefly: ignore [missing-import]
+from pydantic import ValidationError as PydanticValidationError
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -34,29 +39,39 @@ def _validate_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     Basic validation for a 'create user'-style payload.
     Extend this with pydantic if you want stricter typing.
     """
-    required_fields = ["user_id", "name", "email"]
-    missing = [f for f in required_fields if f not in payload]
-    if missing:
-        raise ValidationError(f"Missing fields: {', '.join(missing)}")
-    return payload
+    try:
+        return UserCreate(**payload)
+    except PydanticValidationError as e:
+        raise ValidationError(e.errors()) from e
 
-def _handle_create_user(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _handle_create_user(payload: UserCreate) -> User:
     """
     Domain logic: in the next steps we'll call DynamoDB here.
     For now it just echoes the payload back with a flag.
     """
-    try:
+    created_at = datetime.now(timezone.utc)
 
-        user = {
-            "user_id": payload["user_id"],
-            "name": payload["name"],
-            "email": payload["email"],
-            "status": "CREATED"
-        }
+    item = {
+        "pk": f"USER#{payload.user_id}",
+        "sk": "PROFILE",
+        "user_id": payload.user_id,
+        "name": payload.name,
+        "email": payload.email,
+        "created_at": created_at.isoformat(),
+        "status": "CREATED"
+    }
 
-        return user
-    except Exception as e:
-        raise PersistenceError(f"Error saving user {payload.get('user_id')}: {e}") from e
+    put_user_item(item)
+
+
+    return User(
+        user_id=payload.user_id,
+        name=payload.name,
+        email=payload.email,
+        created_at=created_at,
+        status="CREATED",
+    )
+    
 
 def _build_response(status_code: int, body: Dict[str, Any]) -> Dict[str, Any]:
     return {
@@ -65,7 +80,7 @@ def _build_response(status_code: int, body: Dict[str, Any]) -> Dict[str, Any]:
         "body": json.dumps(body)
     }
 
-def lamdba_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
         AWS Lambda entry point.
         This is the only function AWS / LocalStack needs to know about.
@@ -74,10 +89,10 @@ def lamdba_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     logger.info("Received event: %s", json.dumps(event))
 
     try:
-        payload = _parse_event(event)
-        payload = _validate_payload(payload)
-        user = _handle_create_user(payload)
-        return _build_response(201, {"user": user})
+        payload_dict = _parse_event(event)
+        user_create = _validate_payload(payload_dict)
+        user = _handle_create_user(user_create)
+        return _build_response(201, {"user": user.model_dump(mode='json')})
     except ValidationError as e:
         logger.warning("Validation error: %s", e)
         return _build_response(400, {"error": "Validation error", "details": str(e)})
